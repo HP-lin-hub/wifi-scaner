@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Wi-Fi Scanner</title>
+<script src="https://cdn.socket.io/4.7.1/socket.io.min.js"></script>
+<style>
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #aaa; padding: 5px; text-align: center; }
+  th { cursor: pointer; }
+  .WPA3 { color: blue; }
+  .WPA2 { color: green; }
+  .WPA { color: orange; }
+  .WEP { color: red; }
+  .Open { color: gray; }
+  .wps-ok { color: green; }
+  .wps-no { color: red; }
+</style>
+</head>
+<body>
+<h2>Wi-Fi Scanner</h2>
+
+<label>Interface:
+<select id="interface"></select>
+</label>
+
+<label><input type="checkbox" class="freq" value="2.4"> 2.4 GHz</label>
+<label><input type="checkbox" class="freq" value="5"> 5 GHz</label>
+<label><input type="checkbox" class="freq" value="6"> 6 GHz</label>
+
+<button onclick="startScan()">Start</button>
+<button onclick="stopScan()">Stop</button>
+
+<table id="networks">
+<thead>
+<tr>
+<th onclick="sortTable(0)">№</th>
+<th onclick="sortTable(1)">SSID</th>
+<th onclick="sortTable(2)">MAC</th>
+<th onclick="sortTable(3)">Channel</th>
+<th onclick="sortTable(4)">Freq (MHz)</th>
+<th onclick="sortTable(5)">Signal</th>
+<th onclick="sortTable(6)">Security</th>
+<th onclick="sortTable(7)">Cipher</th>
+<th>WPS</th>
+</tr>
+</thead>
+<tbody></tbody>
+</table>
+
+<script>
+let socket = io();
+let networks = [];
+
+function fetchInterfaces() {
+  fetch("/interfaces")
+  .then(res => res.json())
+  .then(data => {
+    let sel = document.getElementById("interface");
+    sel.innerHTML = "";
+    data.forEach(iface => {
+      let opt = document.createElement("option");
+      opt.value = iface;
+      opt.innerText = iface;
+      sel.appendChild(opt);
+    });
+  });
+}
+
+function startScan() {
+  let iface = document.getElementById("interface").value;
+  let freqs = [];
+  document.querySelectorAll(".freq:checked").forEach(cb => freqs.push(cb.value));
+  fetch("/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interface: iface, freqs: freqs })
+  });
+}
+
+function stopScan() {
+  fetch("/stop", { method: "POST" });
+}
+
+socket.on("update", data => {
+  networks = data;
+  renderTable();
+});
+
+function renderTable() {
+  let tbody = document.querySelector("#networks tbody");
+  tbody.innerHTML = "";
+  networks.forEach((net, i) => {
+    let tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${i+1}</td>
+      <td>${net.ssid}</td>
+      <td>${net.mac}</td>
+      <td>${net.channel}</td>
+      <td>${net.freq}</td>
+      <td>${net.signal}</td>
+      <td class="${net.security}">${net.security}</td>
+      <td>${net.cipher}</td>
+      <td class="${net.wps.startsWith("✔") ? 'wps-ok' : 'wps-no'}">${net.wps}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// Сортировка по столбцу
+function sortTable(n) {
+  let table = document.getElementById("networks");
+  let rows = Array.from(table.rows).slice(1);
+  let asc = table.asc = !table.asc;
+  rows.sort((a, b) => {
+    let x = a.cells[n].innerText.toLowerCase();
+    let y = b.cells[n].innerText.toLowerCase();
+    return (x < y ? -1 : x > y ? 1 : 0) * (asc ? 1 : -1);
+  });
+  rows.forEach(r => table.tBodies[0].appendChild(r));
+}
+
+fetchInterfaces();
+</script>
+</body>
+</html>
