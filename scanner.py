@@ -1,208 +1,362 @@
-# scanner.py
 import subprocess
 import re
+import json
+import os
+from typing import List, Dict
 
-def freq_to_channel(freq):
-    """Вычислить номер канала по частоте (MHz)."""
-    try:
-        f = int(float(freq))
-    except Exception:
-        return 0
-    # 2.4 GHz channels
-    if 2412 <= f <= 2484:
-        return (f - 2407) // 5
-    # 5 GHz
-    if 5000 <= f <= 5900:
-        return (f - 5000) // 5
-    # 6 GHz (typical 5925..7125)
-    if 5925 <= f <= 7125:
-        return (f - 5950) // 5
-    return 0
+# Диапазоны WiFi и соответствующие частоты (в МГц)
+BAND_FREQUENCIES = {
+    "2.4 ГГц": [2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472, 2484],
+    "U-NII-1 (5150–5250 МГц)": [5180, 5200, 5220, 5240],
+    "U-NII-2 (5250–5350 МГц)": [5260, 5280, 5300, 5320],
+    "U-NII-2 Extended (5470–5725 МГц)": [5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720],
+    "U-NII-3 (5725–5850 МГц)": [5745, 5765, 5785, 5805, 5825],
+    "6 ГГц (Wi-Fi 6E)": [5955, 5975, 5995, 6015, 6035, 6055, 6075, 6095, 6115, 6135, 6155, 6175, 6195, 6215, 6235, 6255,
+                         6275, 6295, 6315, 6335]
+}
 
-_RE_BSS = re.compile(
-    r'(?m)^BSS\s+([0-9a-f:]{17})'                  # MAC
-    r'(?:\([^\)]*\))?.*?'                          # optional "(on ...)" and rest of line
-    r'(?=(?:\n^BSS\s+[0-9a-f:]{17})|\Z)',          # up to next BSS or EOF
-    re.DOTALL | re.IGNORECASE
-)
 
-def _extract_pairwise(block):
-    m = re.search(r'Pairwise ciphers:\s*(.*)', block, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # fallback: look for "Pairwise ciphers" inside RSN/WPA subsections (with bullets)
-    m2 = re.search(r'Pairwise ciphers:\s*\n(?:\s*\*\s*)?([A-Za-z0-9 ,/]+)', block, re.IGNORECASE)
-    if m2:
-        return m2.group(1).strip()
-    return ""
+class WiFiScanner:
+    def __init__(self, interface: str = ""):
+        self.interface = interface
+        self.selected_bands = ["2.4 ГГц"]
+        self.mac_vendors = self.load_mac_vendors()
 
-def _extract_group_cipher(block):
-    m = re.search(r'Group cipher:\s*(.*)', block, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-def _extract_channel_from_block(block):
-    m = re.search(r'DS Parameter set:\s*channel\s*(\d+)', block, re.IGNORECASE)
-    if m:
+    def load_mac_vendors(self):
+        """Загрузка базы производителей из JSON файла в новом формате"""
         try:
-            return int(m.group(1))
-        except:
-            return None
-    # sometimes: HT operation: * primary channel: N
-    m2 = re.search(r'primary channel:\s*(\d+)', block, re.IGNORECASE)
-    if m2:
+            vendors_file = os.path.join(os.path.dirname(__file__), 'mac_vendors.json')
+            with open(vendors_file, 'r', encoding='utf-8') as f:
+                vendors_data = json.load(f)
+
+            # Преобразуем в словарь для быстрого поиска
+            vendors_dict = {}
+            for item in vendors_data:
+                if 'macPrefix' in item and 'vendorName' in item:
+                    # Нормализуем MAC-префикс (убираем тире, если есть)
+                    mac_prefix = item['macPrefix'].replace('-', ':').lower()
+                    vendors_dict[mac_prefix] = item['vendorName']
+
+            print(f"Загружено {len(vendors_dict)} производителей из базы данных")
+            return vendors_dict
+
+        except FileNotFoundError:
+            print("Файл базы производителей mac_vendors.json не найден")
+            return {}
+        except json.JSONDecodeError as e:
+            print(f"Ошибка чтения файла базы производителей: {e}")
+            return {}
+        except Exception as e:
+            print(f"Неожиданная ошибка при загрузке базы производителей: {e}")
+            return {}
+
+    def get_vendor_by_mac(self, mac_address):
+        """Определение производителя по MAC-адресу с использованием новой базы"""
+        if not self.mac_vendors:
+            return "Unknown"
+
+        # Нормализуем MAC-адрес
+        mac = mac_address.lower().replace('-', ':')
+
+        # Пробуем найти производителя по префиксам разной длины
+        for prefix_length in [8, 5, 2]:  # 6, 3, 1 байт соответственно (a0:de:0f, a0:de, a0)
+            prefix = mac[:prefix_length]
+            if prefix in self.mac_vendors:
+                return self.mac_vendors[prefix]
+
+        return "Unknown"
+
+    def set_bands(self, bands: List[str]):
+        """Установить выбранные диапазоны"""
+        self.selected_bands = bands
+
+    def check_interface_exists(self) -> bool:
+        """Проверить существование интерфейса"""
+        if not self.interface:
+            return False
+
         try:
-            return int(m2.group(1))
+            result = subprocess.run(["ip", "link", "show", self.interface],
+                                    capture_output=True, text=True)
+            return result.returncode == 0
         except:
-            return None
-    return None
+            return False
 
-def _extract_wps(block):
-    """
-    Возвращает строку: "✖" или "✔ : Version X" или "✔" если нет версии.
-    Также учитывает состояние (Wi-Fi Protected Setup State: 2 — Configured).
-    """
-    m = re.search(r'WPS:\s*(?:\n(?:\s*[\*\w\-\:\(\)\.].*)+)?', block, re.IGNORECASE)
-    if not m:
-        return "✖"
-    wps_block = m.group(0)
-    ver = None
-    state = None
-    mv = re.search(r'\bVersion[:\s]*([\d\.]+)', wps_block, re.IGNORECASE)
-    if mv:
-        ver = mv.group(1).strip()
-    ms = re.search(r'Wi-?Fi Protected Setup State[:\s]*([0-9]+)', wps_block, re.IGNORECASE)
-    if ms:
-        state = ms.group(1).strip()
-    if ver and state:
-        return f"✔ : Version {ver}" if state == "2" else f"✖ : Version {ver}"
-    if ver:
-        return f"✔ : Version {ver}"
-    return "✔"
+    def check_rfkill_unblock(self):
+        """Разблокировать WiFi через rfkill"""
+        try:
+            subprocess.run(["sudo", "rfkill", "unblock", "wifi"],
+                           capture_output=True)
+            subprocess.run(["sudo", "rfkill", "unblock", "all"],
+                           stderr=subprocess.DEVNULL)
+            return True
+        except:
+            return False
 
-def parse_iw_scan(interface, freqs=[]):
-    """
-    interface - имя интерфейса (wlp..., wlan...)
-    freqs - список строк: "2.4", "5", "6" — если пустой, возвращает все сети.
-    Возвращает список словарей с полями:
-    ssid, mac, channel, freq, signal, security, cipher, wps
-    """
-    networks = []
-    try:
-        res = subprocess.run(["iw", "dev", interface, "scan"],
-                             capture_output=True, text=True, timeout=8)
-        out = res.stdout
-    except Exception as e:
-        # Не падаем — возвращаем пустой список и печатаем ошибку (чтобы видно было в логах)
-        print(f"[scanner] iw scan failed: {e}")
-        return networks
+    def get_supported_bands(self) -> List[str]:
+        """Получить список поддерживаемых диапазонов"""
+        try:
+            # Проверяем поддержку 6 ГГц
+            result = subprocess.run(["iw", "phy", "phy0", "info"],
+                                    capture_output=True, text=True)
+            output = result.stdout.lower()
 
-    # Найдём все BSS-блоки при помощи регулярки (надёжнее, чем простое split)
-    for m in _RE_BSS.finditer(out):
-        mac = m.group(1).lower()
-        block = m.group(0)
+            supported_bands = ["2.4 ГГц"]
 
-        # убираем возможные "(on ...)" в mac (на всякий случай)
-        mac = mac.replace("(on", "").replace(")", "").strip()
+            if any(freq in output for freq in ["5150", "5180", "5200"]):
+                supported_bands.extend(["U-NII-1 (5150–5250 МГц)", "U-NII-2 (5250–5350 МГц)"])
 
-        # Получаем SSID (может отсутствовать — скрытая сеть)
-        ssid_m = re.search(r'^\s*SSID:\s*(.*)$', block, re.MULTILINE)
-        ssid = ssid_m.group(1).strip() if ssid_m else ""
+            if any(freq in output for freq in ["5470", "5500", "5720"]):
+                supported_bands.append("U-NII-2 Extended (5470–5725 МГц)")
 
-        # freq
-        freq = None
-        fm = re.search(r'^\s*freq:\s*([\d\.]+)', block, re.MULTILINE)
-        if fm:
-            try:
-                freq = int(float(fm.group(1)))
-            except:
-                freq = None
+            if any(freq in output for freq in ["5725", "5745", "5825"]):
+                supported_bands.append("U-NII-3 (5725–5850 МГц)")
 
-        # signal
-        sig = ""
-        sm = re.search(r'^\s*signal:\s*([-0-9\.]+\s*dBm)', block, re.MULTILINE | re.IGNORECASE)
-        if sm:
-            sig = sm.group(1).strip()
-        else:
-            # иногда просто "signal: -65.00 dBm"
-            sm2 = re.search(r'signal:\s*([-0-9\.]+)\s*dBm', block, re.IGNORECASE)
-            if sm2:
-                sig = f"{sm2.group(1).strip()} dBm"
+            # Проверяем поддержку 6 ГГц (Wi-Fi 6E)
+            if any(freq in output for freq in ["5955", "5975", "6115"]):
+                supported_bands.append("6 ГГц (Wi-Fi 6E)")
 
-        # channel — сначала пробуем извлечь явно, иначе по freq
-        ch = _extract_channel_from_block(block)
-        if not ch and freq:
-            ch = freq_to_channel(freq)
-        ch = ch or 0
+            return supported_bands
 
-        # security / cipher detection
-        lower = block.lower()
-        security = "Open"
-        cipher = ""
+        except Exception as e:
+            print(f"Error checking supported bands: {e}")
+            return list(BAND_FREQUENCIES.keys())
 
-        # WPA3: поиск SAE/OWE/DPP/WPA3
-        if re.search(r'\bwpa3\b', lower) or re.search(r'\bsae\b', lower) or re.search(r'\bowe\b', lower) or re.search(r'\bdpp\b', lower):
-            security = "WPA3"
-            pairwise = _extract_pairwise(block)
-            group = _extract_group_cipher(block)
-            cipher = ", ".join(filter(None, [pairwise, group])) or "CCMP"
+    def generate_scan_command(self) -> List[str]:
+        """Сгенерировать команду для сканирования выбранных диапазонов"""
+        if not self.interface:
+            raise ValueError("Интерфейс не выбран")
 
-        # RSN -> WPA2
-        elif 'rsn:' in lower or re.search(r'\brsn\b', lower):
-            security = "WPA2"
-            pairwise = _extract_pairwise(block)
-            group = _extract_group_cipher(block)
-            cipher = ", ".join(filter(None, [pairwise, group])) or "CCMP"
+        if not self.check_interface_exists():
+            raise ValueError(f"Интерфейс {self.interface} не существует")
 
-        # WPA (legacy) presence
-        elif re.search(r'\bwpa:\b', block, re.IGNORECASE) or re.search(r'\bWPA:\s*\*', block):
-            security = "WPA"
-            pairwise = _extract_pairwise(block)
-            group = _extract_group_cipher(block)
-            cipher = ", ".join(filter(None, [pairwise, group])) or "TKIP"
+        # Разблокируем WiFi
+        self.check_rfkill_unblock()
 
-        # WEP
-        elif 'wep' in lower:
-            security = "WEP"
-            cipher = "WEP"
+        frequencies = []
+        for band in self.selected_bands:
+            if band in BAND_FREQUENCIES:
+                frequencies.extend(BAND_FREQUENCIES[band])
 
-        # capability privacy fallback (если нет RSN/WPA/WEP, но есть Privacy в capability — считаем WPA2)
-        else:
-            cap_m = re.search(r'capability:\s*(.*)', lower)
-            if cap_m and 'privacy' in cap_m.group(1):
-                security = "WPA2"
-                pairwise = _extract_pairwise(block)
-                cipher = pairwise or "Unknown"
+        if not frequencies:
+            raise ValueError("Не выбраны диапазоны для сканирования")
 
-        # Если не нашлось cipher — попытаемся взять Pairwise/Group ещё раз
-        if not cipher:
-            pairwise = _extract_pairwise(block)
-            group = _extract_group_cipher(block)
-            cipher = ", ".join(filter(None, [pairwise, group])) or ""
+        # Формируем команду iw с частотами
+        cmd = ["sudo", "iw", "dev", self.interface, "scan"]
+        for freq in frequencies:
+            cmd.extend(["freq", str(freq)])
 
-        # WPS
-        wps = _extract_wps(block)
+        return cmd
 
-        # Фильтрация по диапазонам (если указан freqs)
-        if freqs and freq:
-            band = ""
-            if 2400 <= freq <= 2500: band = "2.4"
-            elif 5000 <= freq <= 5900: band = "5"
-            elif 5925 <= freq <= 7125: band = "6"
-            if band not in freqs:
+    def scan(self) -> Dict:
+        """Выполнить сканирование выбранных диапазонов"""
+        try:
+            cmd = self.generate_scan_command()
+            print(f"Executing command: {' '.join(cmd)}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+
+            if result.returncode != 0:
+                # Пробуем разблокировать и повторить
+                self.check_rfkill_unblock()
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    error_msg = result.stderr if result.stderr else "Unknown error"
+                    return {"error": f"Ошибка сканирования: {error_msg}"}
+
+            return self.parse_output(result.stdout)
+
+        except subprocess.TimeoutExpired:
+            return {"error": "Таймаут сканирования"}
+        except Exception as e:
+            return {"error": f"Ошибка: {str(e)}"}
+
+    def parse_output(self, output: str) -> Dict:
+        """Парсинг вывода команды iw scan (поблочный)"""
+        networks = []
+        # Разделяем вывод на блоки по BSS
+        blocks = re.split(r'\nBSS ', output)
+
+        for block in blocks:
+            if not block.strip():
                 continue
 
-        # Добавляем запись (SSID может быть пустым — скрытые сети)
-        networks.append({
-            "ssid": ssid,
-            "mac": mac,
-            "channel": ch,
-            "freq": freq or 0,
-            "signal": sig,
-            "security": security,
-            "cipher": cipher,
-            "wps": wps
-        })
+            # Добавляем обратно "BSS " к каждому блоку, кроме первого
+            if not block.startswith("BSS"):
+                block = "BSS " + block
 
-    return networks
+            current_ap = self.parse_block(block)
+            if current_ap and current_ap.get("bssid"):
+                # Фильтрация по выбранным диапазонам
+                if self.is_in_selected_bands(current_ap.get("frequency", "")):
+                    networks.append(current_ap)
+
+        return {"networks": networks}
+
+    def is_in_selected_bands(self, frequency_str: str) -> bool:
+        """Проверить, принадлежит ли частота выбранным диапазонам"""
+        if not frequency_str or not self.selected_bands:
+            return True
+
+        try:
+            freq = int(float(frequency_str))
+            for band in self.selected_bands:
+                if band in BAND_FREQUENCIES and freq in BAND_FREQUENCIES[band]:
+                    return True
+            return False
+        except (ValueError, TypeError):
+            return True
+
+    def parse_block(self, block: str) -> Dict:
+        """Парсинг одного блока с информацией о сети"""
+        lines = block.split('\n')
+        current_ap = {
+            "bssid": "",
+            "ssid": "Hidden",
+            "frequency": "",
+            "signal": "",
+            "security": "Open",
+            "vendor": "Unknown"
+        }
+
+        # Регулярное выражение для извлечения MAC-адреса (учитываем скобки)
+        mac_match = re.search(r'BSS ([0-9a-fA-F:]+)(?:\(| |$)', block)
+        if mac_match:
+            current_ap["bssid"] = mac_match.group(1)
+            # Определяем производителя по MAC-адресу
+            current_ap["vendor"] = self.get_vendor_by_mac(current_ap["bssid"])
+        else:
+            # Если не удалось извлечь MAC, пропускаем блок
+            return None
+
+        # Флаги для определения безопасности
+        has_privacy = False
+        has_rsn = False
+        has_wpa = False
+        has_wpa2 = False
+        has_wpa3 = False
+        has_wep = False
+
+        # Детальная информация о безопасности
+        security_details = {
+            "group_cipher": "",
+            "pairwise_ciphers": [],
+            "auth_suites": [],
+            "key_management": []
+        }
+
+        for line in lines:
+            line = line.strip()
+
+            # Парсим SSID
+            if "SSID:" in line and not line.startswith("RSN") and not line.startswith("WPA"):
+                ssid_match = re.search(r'SSID:\s*(.+)', line)
+                if ssid_match:
+                    current_ap["ssid"] = ssid_match.group(1).strip()
+
+            # Парсим частоту
+            elif "freq:" in line:
+                freq_match = re.search(r'freq:\s*([\d.]+)', line)
+                if freq_match:
+                    current_ap["frequency"] = freq_match.group(1)
+
+            # Парсим сигнал
+            elif "signal:" in line:
+                signal_match = re.search(r'signal:\s*([-\d.]+)', line)
+                if signal_match:
+                    current_ap["signal"] = signal_match.group(1)
+
+            # Определяем безопасность - capability
+            elif "capability:" in line:
+                if "PRIVACY" in line:
+                    has_privacy = True
+                    has_wep = True  # PRIVACY обычно означает WEP
+
+            # Анализ RSN (WPA2/WPA3)
+            elif line.strip().startswith("RSN:"):
+                has_rsn = True
+                has_wpa2 = True
+
+                # Детальный анализ RSN элементов
+                if "CCMP" in line:
+                    security_details["group_cipher"] = "CCMP"
+                if "TKIP" in line:
+                    security_details["group_cipher"] = "TKIP"
+                if "PSK" in line:
+                    security_details["auth_suites"].append("PSK")
+                if "802.1X" in line or "EAP" in line:
+                    security_details["auth_suites"].append("Enterprise")
+                if "SAE" in line:
+                    has_wpa3 = True
+                    security_details["auth_suites"].append("SAE")
+
+            # Анализ WPA (WPA1)
+            elif line.strip().startswith("WPA:"):
+                has_wpa = True
+                if "CCMP" in line:
+                    security_details["group_cipher"] = "CCMP"
+                if "TKIP" in line:
+                    security_details["group_cipher"] = "TKIP"
+                if "PSK" in line:
+                    security_details["auth_suites"].append("PSK")
+
+            # Анализ информации о безопасности в других форматах
+            elif "Authentication suites:" in line:
+                if "PSK" in line:
+                    security_details["auth_suites"].append("PSK")
+                if "802.1X" in line or "EAP" in line:
+                    security_details["auth_suites"].append("Enterprise")
+                if "SAE" in line:
+                    has_wpa3 = True
+                    security_details["auth_suites"].append("SAE")
+
+            # Определение OWE (Opportunistic Wireless Encryption)
+            elif "OWE" in line:
+                current_ap["security"] = "OWE"
+
+        # Определяем тип безопасности на основе собранных данных
+        if has_wpa3:
+            current_ap["security"] = "WPA3"
+        elif has_rsn and "SAE" in security_details["auth_suites"]:
+            current_ap["security"] = "WPA3"
+        elif has_rsn:
+            current_ap["security"] = "WPA2"
+        elif has_wpa:
+            current_ap["security"] = "WPA"
+        elif has_privacy and has_wep:
+            current_ap["security"] = "WEP"
+        else:
+            current_ap["security"] = "Open"
+
+        # Добавляем детальную информацию о безопасности
+        current_ap["security_details"] = security_details
+
+        return current_ap
+
+    def enhanced_security_detection(self, block: str) -> str:
+        """Улучшенное определение безопасности на основе полного анализа блока"""
+        security = "Open"
+
+        # Проверяем различные паттерны безопасности
+        if "RSN:" in block and "PSK" in block:
+            security = "WPA2-Personal"
+        elif "RSN:" in block and "EAP" in block:
+            security = "WPA2-Enterprise"
+        elif "WPA:" in block and "PSK" in block:
+            security = "WPA-Personal"
+        elif "WPA:" in block and "EAP" in block:
+            security = "WPA-Enterprise"
+        elif "PRIVACY" in block:
+            security = "WEP"
+        elif "SAE" in block:
+            security = "WPA3"
+        elif "OWE" in block:
+            security = "OWE"
+
+        return security
